@@ -1,8 +1,9 @@
 import logging
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.agent.orchestrator import AgentOrchestrator
 from src.config import settings
@@ -17,21 +18,28 @@ registry.auto_discover()
 memory = MemoryManager(storage_path=settings.memory_storage_path)
 agent = AgentOrchestrator(tool_registry=registry, memory=memory)
 
-app = FastAPI(title="Wingman Clone", version="0.2.1")
+app = FastAPI(title="Wingman Clone", version="0.2.2")
 
 # --- CORS Configuration ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 # --- Request / Response models ---
 class ChatRequest(BaseModel):
-    prompt: str
+    # Support both 'prompt' (old) and 'message' (new Wingman UI)
+    prompt: Optional[str] = None
+    message: Optional[str] = None
+    history: Optional[list[dict]] = Field(default_factory=list)
+
+    @property
+    def query(self) -> str:
+        return self.message or self.prompt or ""
 
 
 class ChatResponse(BaseModel):
@@ -57,11 +65,13 @@ async def health():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    if not req.prompt.strip():
-        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    query = req.query
+    if not query.strip():
+        raise HTTPException(status_code=400, detail="Prompt or message cannot be empty")
     
     try:
-        result = await agent.process(req.prompt)
+        # We pass the history from the frontend to the agent process
+        result = await agent.process(query, history=req.history)
         return ChatResponse(response=result.content, tool_calls=result.tool_calls)
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
