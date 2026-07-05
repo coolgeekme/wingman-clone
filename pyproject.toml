@@ -1,0 +1,9 @@
+[project]
+name = "wingman-clone"
+version = "0.2.0"
+description = "A modular AI personal assistant framework with swappable LLM providers"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
