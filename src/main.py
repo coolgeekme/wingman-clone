@@ -18,7 +18,7 @@ registry.auto_discover()
 memory = MemoryManager(storage_path=settings.memory_storage_path)
 agent = AgentOrchestrator(tool_registry=registry, memory=memory)
 
-app = FastAPI(title="Wingman Clone", version="0.3.1")
+app = FastAPI(title="Wingman Clone", version="0.3.3")
 
 # --- CORS Configuration ---
 app.add_middleware(
@@ -96,25 +96,47 @@ async def save_fact(req: FactRequest):
 
 @app.get("/integrations/connect/{app_name}")
 async def get_connection_url(app_name: str, redirect_url: Optional[str] = None):
+    """Initiate OAuth connection for a given app using Composio SDK v0.17+."""
     if not settings.composio_api_key:
         raise HTTPException(status_code=500, detail="COMPOSIO_API_KEY not configured")
     
     try:
         from composio import Composio
+        from composio_langchain import LangchainProvider
         
-        # New pattern for Composio SDK v0.17+
-        sdk = Composio(api_key=settings.composio_api_key)
+        client = Composio(provider=LangchainProvider(), api_key=settings.composio_api_key)
         
-        # Initiate connection for the specific app
-        connection = sdk.toolkits.get(app_name.lower()).initiate_connection(
-            redirect_url=redirect_url
+        # Find the auth config for the requested app
+        auth_configs = client.auth_configs.list()
+        app_slug = app_name.lower()
+        auth_config_id = None
+        
+        for item in auth_configs.items:
+            if hasattr(item, 'toolkit') and item.toolkit.slug == app_slug and item.status == 'ENABLED':
+                auth_config_id = item.id
+                break
+        
+        if not auth_config_id:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No auth config found for app '{app_name}'. Create one in the Composio dashboard first."
+            )
+        
+        # Initiate the connection
+        connection = client.connected_accounts.initiate(
+            user_id="default",
+            auth_config_id=auth_config_id,
+            callback_url=redirect_url,
+            allow_multiple=True,
         )
         
         return {
             "app_name": app_name,
             "redirect_url": connection.redirect_url,
-            "connection_id": connection.connection_id
+            "connection_id": connection.id,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to initiate connection for {app_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -122,16 +144,26 @@ async def get_connection_url(app_name: str, redirect_url: Optional[str] = None):
 
 @app.get("/integrations/list")
 async def list_integrations():
+    """List available app integrations."""
     if not settings.composio_api_key:
         return {"integrations": []}
     
     try:
-        # Curated list of apps supported in the UI
-        apps = ["gmail", "googlecalendar", "github", "slack", "notion", "discord", "linkedin"]
-        return {"integrations": apps}
+        from composio import Composio
+        from composio_langchain import LangchainProvider
+        
+        client = Composio(provider=LangchainProvider(), api_key=settings.composio_api_key)
+        auth_configs = client.auth_configs.list()
+        
+        apps = list(set(
+            item.toolkit.slug
+            for item in auth_configs.items
+            if hasattr(item, 'toolkit') and item.status == 'ENABLED'
+        ))
+        return {"integrations": sorted(apps)}
     except Exception as e:
         logger.error(f"Failed to list integrations: {e}")
-        return {"integrations": []}
+        return {"integrations": ["gmail", "googlecalendar", "github", "slack", "notion", "discord", "linkedin"]}
 
 
 if __name__ == "__main__":

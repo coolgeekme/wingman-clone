@@ -1,7 +1,7 @@
 """Composio Toolset wrapper for the Wingman Clone agent.
 
 Provides access to 250+ external app integrations.
-Updated for v0.17+ with dangerously_skip_version_check=True to avoid version errors.
+Uses the Composio SDK v0.17+ with LangchainProvider.
 """
 import logging
 from typing import Optional
@@ -11,38 +11,39 @@ from src.tools.base import BaseTool, ToolResult
 logger = logging.getLogger(__name__)
 
 
-def _get_composio_sdk():
+def _get_composio_client():
+    """Create and return a Composio client with LangchainProvider."""
     api_key = settings.composio_api_key
     if not api_key:
+        logger.warning("COMPOSIO_API_KEY not set.")
         return None
     try:
         from composio import Composio
         from composio_langchain import LangchainProvider
-        # Initialize with version check skipping to prevent manual execution errors
-        sdk = Composio(provider=LangchainProvider(), api_key=api_key)
-        return sdk
+        return Composio(provider=LangchainProvider(), api_key=api_key)
     except Exception as e:
-        logger.error(f"Failed to initialize Composio SDK: {e}")
+        logger.error(f"Failed to initialize Composio client: {e}")
         return None
 
 
 def get_composio_langchain_tools(
     apps: Optional[list[str]] = None,
     actions: Optional[list[str]] = None,
-    user_id: str = "default",
 ) -> list:
-    sdk = _get_composio_sdk()
-    if sdk is None:
+    """Initialize and return Composio tools for use with LangChain agents."""
+    client = _get_composio_client()
+    if client is None:
         return []
     try:
-        kwargs = {"user_id": user_id}
+        kwargs = {"user_id": "default"}
         if actions:
             kwargs["tools"] = actions
         elif apps:
             kwargs["toolkits"] = apps
         else:
             kwargs["toolkits"] = ["github"]
-        tools = sdk.tools.get(**kwargs)
+        
+        tools = client.tools.get(**kwargs)
         return list(tools) if tools else []
     except Exception as e:
         logger.error(f"Failed to get Composio tools: {e}")
@@ -62,16 +63,14 @@ class ComposioTool(BaseTool):
     }
 
     async def execute(self, action: str, params: Optional[dict] = None, **kwargs) -> ToolResult:
-        sdk = _get_composio_sdk()
-        if sdk is None:
+        client = _get_composio_client()
+        if client is None:
             return ToolResult(success=False, error="COMPOSIO_API_KEY not configured")
         try:
-            # We use the SDK client to execute directly with version skipping
-            result = sdk.client.tools.execute(
-                slug=action, 
-                arguments=params or {},
-                dangerously_skip_version_check=True
-            )
+            tools = client.tools.get(user_id="default", tools=[action])
+            if not tools:
+                return ToolResult(success=False, error=f"Tool '{action}' not found")
+            result = tools[0].invoke(params or {})
             return ToolResult(success=True, data=result)
         except Exception as e:
             logger.error(f"Composio execute failed for {action}: {e}")
