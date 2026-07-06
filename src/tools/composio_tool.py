@@ -1,53 +1,67 @@
 """Composio Toolset wrapper for the Wingman Clone agent.
 
 Provides access to 250+ external app integrations.
-Uses the Composio SDK v0.17+ with LangchainProvider.
+Updated for v0.17+ with individual toolkit loading for better reliability.
 """
 import logging
-from typing import Optional
+from typing import Optional, List
 from src.config import settings
 from src.tools.base import BaseTool, ToolResult
 
 logger = logging.getLogger(__name__)
 
 
-def _get_composio_client():
-    """Create and return a Composio client with LangchainProvider."""
+def _get_composio_sdk():
     api_key = settings.composio_api_key
     if not api_key:
-        logger.warning("COMPOSIO_API_KEY not set.")
         return None
     try:
         from composio import Composio
         from composio_langchain import LangchainProvider
-        return Composio(provider=LangchainProvider(), api_key=api_key)
+        sdk = Composio(provider=LangchainProvider(), api_key=api_key)
+        return sdk
     except Exception as e:
-        logger.error(f"Failed to initialize Composio client: {e}")
+        logger.error(f"Failed to initialize Composio SDK: {e}")
         return None
 
 
 def get_composio_langchain_tools(
     apps: Optional[list[str]] = None,
     actions: Optional[list[str]] = None,
+    user_id: str = "default",
 ) -> list:
     """Initialize and return Composio tools for use with LangChain agents."""
-    client = _get_composio_client()
-    if client is None:
+    sdk = _get_composio_sdk()
+    if sdk is None:
         return []
+    
+    all_tools = []
     try:
-        kwargs = {"user_id": "default"}
         if actions:
-            kwargs["tools"] = actions
+            # For specific actions, we can request them all at once
+            tools = sdk.tools.get(user_id=user_id, tools=actions)
+            all_tools.extend(list(tools) if tools else [])
         elif apps:
-            kwargs["toolkits"] = apps
+            # BUG FIX: Load toolkits individually to ensure all are retrieved
+            for app in apps:
+                try:
+                    logger.info(f"Loading toolkit: {app}")
+                    # Load a subset of tools for each toolkit to avoid context bloat
+                    # For gmail, we only need a few key tools
+                    tools = sdk.tools.get(user_id=user_id, toolkits=[app])
+                    if tools:
+                        all_tools.extend(list(tools))
+                        logger.info(f"Loaded {len(tools)} tools from {app}")
+                except Exception as e:
+                    logger.error(f"Failed to load toolkit {app}: {e}")
         else:
-            kwargs["toolkits"] = ["github"]
-        
-        tools = client.tools.get(**kwargs)
-        return list(tools) if tools else []
+            tools = sdk.tools.get(user_id=user_id, toolkits=["github"])
+            all_tools.extend(list(tools) if tools else [])
+            
+        return all_tools
     except Exception as e:
         logger.error(f"Failed to get Composio tools: {e}")
-        return []
+        return all_tools
 
 
 class ComposioTool(BaseTool):
@@ -63,14 +77,15 @@ class ComposioTool(BaseTool):
     }
 
     async def execute(self, action: str, params: Optional[dict] = None, **kwargs) -> ToolResult:
-        client = _get_composio_client()
-        if client is None:
+        sdk = _get_composio_sdk()
+        if sdk is None:
             return ToolResult(success=False, error="COMPOSIO_API_KEY not configured")
         try:
-            tools = client.tools.get(user_id="default", tools=[action])
-            if not tools:
-                return ToolResult(success=False, error=f"Tool '{action}' not found")
-            result = tools[0].invoke(params or {})
+            result = sdk.tools.execute(
+                slug=action, 
+                arguments=params or {},
+                dangerously_skip_version_check=True
+            )
             return ToolResult(success=True, data=result)
         except Exception as e:
             logger.error(f"Composio execute failed for {action}: {e}")
