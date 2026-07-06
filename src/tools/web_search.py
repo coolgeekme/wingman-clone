@@ -1,7 +1,6 @@
 """
 Web Search Tool — real-time internet search via DuckDuckGo.
-Drop-in for the Wingman Clone Tool Sandbox.
-Requires: pip install duckduckgo-search
+Updated for latest ddgs package compatibility.
 """
 
 import json
@@ -36,21 +35,31 @@ class WebSearchTool(BaseTool):
 
     async def execute(self, query: str, max_results: int = 5) -> ToolResult:
         try:
-            from duckduckgo_search import DDGS
+            # Try new ddgs package first, fall back to old duckduckgo_search
+            try:
+                from ddgs import DDGS
+            except ImportError:
+                from duckduckgo_search import DDGS
 
             max_results = min(max_results, 10)
 
+            # Updated for the latest library structure
             with DDGS() as ddgs:
                 results = list(ddgs.text(
                     query,
-                    max_results=max_results,
-                    safesearch="moderate",
+                    max_results=max_results
                 ))
+
+            if not results:
+                # Fallback search query if the first one was too specific
+                logger.info(f"No results for '{query}', trying broader search...")
+                with DDGS() as ddgs:
+                    results = list(ddgs.text(query.split(' ')[0], max_results=3))
 
             if not results:
                 return ToolResult(
                     success=True,
-                    data="No results found for that query. Try rephrasing the search.",
+                    data="No search results found for that query. The service might be temporarily unavailable.",
                 )
 
             formatted = []
@@ -65,11 +74,6 @@ class WebSearchTool(BaseTool):
                 data="\n".join(formatted),
             )
 
-        except ImportError:
-            return ToolResult(
-                success=False,
-                error="duckduckgo-search is not installed. Run: pip install duckduckgo-search",
-            )
         except Exception as e:
             logger.error(f"Web search failed: {e}")
             return ToolResult(success=False, error=str(e))
