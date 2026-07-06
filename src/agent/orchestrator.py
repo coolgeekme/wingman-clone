@@ -21,7 +21,7 @@ SUPERBRAIN_CONFIG = {
     "tool_timeout": 60,
     "composio_timeout": 90,
     "temperature": 0,
-    "max_tools_to_bind": 100, # Increased for OpenAI
+    "max_tools_to_bind": 100,
 }
 
 COMPLEX_TASK_PATTERNS = [
@@ -46,6 +46,7 @@ class AgentResponse:
     content: str
     tool_calls: list[dict]
     iterations_used: int = 0
+    session_id: str = ""
 
 
 def get_llm(provider: Optional[str] = None):
@@ -132,7 +133,6 @@ class AgentOrchestrator:
             return []
         try:
             from src.tools.composio_tool import get_composio_langchain_tools
-            # Load specific high-priority toolsets for Reggie
             tools = get_composio_langchain_tools(
                 apps=["gmail", "googlecalendar", "github", "slack", "notion"]
             )
@@ -149,10 +149,9 @@ class AgentOrchestrator:
         
         limit = SUPERBRAIN_CONFIG["max_tools_to_bind"]
         if settings.llm_provider == "groq":
-            limit = 40 # Groq is more sensitive
+            limit = 40
             
         if len(all_tools) > limit:
-            # Prioritize core tools
             priority_prefixes = ["GMAIL_", "GOOGLECALENDAR_", "GITHUB_", "WEB_SEARCH"]
             prioritized = []
             others = []
@@ -187,7 +186,6 @@ class AgentOrchestrator:
                                 args = json.loads(tc["function"]["arguments"])
                             except:
                                 args = {}
-                            # Ensure tool_call ID is passed
                             tc_id = tc.get("id") or f"call_{len(tool_calls)}"
                             tool_calls.append({
                                 "id": tc_id,
@@ -196,7 +194,6 @@ class AgentOrchestrator:
                             })
                     lc_messages.append(AIMessage(content=content, tool_calls=tool_calls))
                 elif role == "tool":
-                    # Tool ID MUST match a call ID in the preceding AIMessage
                     lc_messages.append(ToolMessage(content=content, tool_call_id=msg.get("tool_call_id", "unknown")))
             
             llm = self._llm
@@ -219,7 +216,6 @@ class AgentOrchestrator:
                     for i, tc in enumerate(response.tool_calls)
                 ]
             
-            # Hallucination recovery fallback
             if not result.get("tool_calls") and result["content"] and "<function=" in result["content"]:
                 recovered = self._recover_tool_call_v33(result["content"], 99)
                 if recovered:
@@ -252,17 +248,24 @@ class AgentOrchestrator:
                 except: continue
         return None
 
-    async def process(self, user_prompt: str, history: Optional[List[dict]] = None) -> AgentResponse:
-        self.memory.save_message("user", user_prompt)
+    async def process(self, user_prompt: str, history: Optional[List[dict]] = None, session_id: Optional[str] = None) -> AgentResponse:
+        # Save user message to the session
+        self.memory.save_message("user", user_prompt, session_id=session_id)
+        
         system_msg = SYSTEM_PROMPT.format(memory_context=self.memory.get_system_context())
         messages = [{"role": "system", "content": system_msg}]
+        
         if history:
-            # Only use non-empty messages
             messages.extend([h for h in history if h.get("content") or h.get("tool_calls")])
         else:
-            messages.extend(self.memory.get_history()[:-1])
+            # Load history from persistent storage for this session
+            stored_history = self.memory.get_history(session_id=session_id)
+            # Exclude the message we just saved (last one)
+            if stored_history and len(stored_history) > 1:
+                for msg in stored_history[:-1]:
+                    messages.append({"role": msg["role"], "content": msg["content"]})
         
-        # Ensure user prompt is present
+        # Ensure user prompt is present as last message
         if not messages or messages[-1].get("content") != user_prompt:
             messages.append({"role": "user", "content": user_prompt})
 
@@ -276,8 +279,9 @@ class AgentOrchestrator:
             
             if "tool_calls" not in assistant_msg or not assistant_msg["tool_calls"]:
                 final_content = assistant_msg.get("content", "")
-                if final_content: self.memory.save_message("assistant", final_content)
-                return AgentResponse(content=final_content, tool_calls=tool_call_log, iterations_used=iteration+1)
+                if final_content:
+                    self.memory.save_message("assistant", final_content, session_id=session_id)
+                return AgentResponse(content=final_content, tool_calls=tool_call_log, iterations_used=iteration+1, session_id=session_id or "")
 
             for tc in assistant_msg["tool_calls"]:
                 func_name = tc["function"]["name"]
@@ -311,4 +315,6 @@ class AgentOrchestrator:
                 tool_call_log.append({"tool": func_name, "args": func_args, "result": result_text[:1000], "success": success})
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
 
-        return AgentResponse(content=messages[-1].get("content", "Max iterations reached."), tool_calls=tool_call_log, iterations_used=max_iter)
+        final_content = messages[-1].get("content", "Max iterations reached.")
+        self.memory.save_message("assistant", final_content, session_id=session_id)
+        return AgentResponse(content=final_content, tool_calls=tool_call_log, iterations_used=max_iter, session_id=session_id or "")

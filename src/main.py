@@ -18,7 +18,7 @@ registry.auto_discover()
 memory = MemoryManager(storage_path=settings.memory_storage_path)
 agent = AgentOrchestrator(tool_registry=registry, memory=memory)
 
-app = FastAPI(title="Wingman Clone", version="0.3.3")
+app = FastAPI(title="Wingman Clone", version="0.4.0")
 
 # --- CORS Configuration ---
 app.add_middleware(
@@ -34,6 +34,7 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     prompt: Optional[str] = None
     message: Optional[str] = None
+    session_id: Optional[str] = None
     history: Optional[list[dict]] = Field(default_factory=list)
 
     @property
@@ -43,6 +44,7 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    session_id: str = ""
     tool_calls: list[dict] = []
 
 
@@ -51,11 +53,16 @@ class FactRequest(BaseModel):
     value: str
 
 
+class SessionCreate(BaseModel):
+    title: Optional[str] = ""
+
+
 # --- Endpoints ---
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
+        "version": "0.4.0",
         "tools_loaded": len(registry.list_tools()),
         "llm_provider": settings.llm_provider,
         "model": settings.get_active_model(),
@@ -68,12 +75,67 @@ async def chat(req: ChatRequest):
     if not query.strip():
         raise HTTPException(status_code=400, detail="Prompt or message cannot be empty")
     
+    # Use provided session_id or create a new session
+    session_id = req.session_id
+    if not session_id:
+        session_id = memory.create_session(title=query[:80])
+
     try:
-        result = await agent.process(query, history=req.history)
-        return ChatResponse(response=result.content, tool_calls=result.tool_calls)
+        result = await agent.process(query, history=req.history, session_id=session_id)
+        return ChatResponse(response=result.content, session_id=session_id, tool_calls=result.tool_calls)
     except Exception as e:
         logger.error(f"Chat error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Session endpoints ---
+@app.get("/sessions")
+async def list_sessions():
+    """List all chat sessions, most recent first."""
+    sessions = memory.list_sessions()
+    return sessions
+
+
+@app.post("/sessions")
+async def create_session(req: SessionCreate):
+    """Create a new chat session."""
+    session_id = memory.create_session(title=req.title or "")
+    return {"session_id": session_id, "title": req.title or ""}
+
+
+@app.get("/sessions/{session_id}")
+async def get_session(session_id: str):
+    """Get session details."""
+    session = memory.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
+
+
+@app.delete("/sessions/{session_id}")
+async def delete_session(session_id: str):
+    """Delete a session and all its messages."""
+    deleted = memory.delete_session(session_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"status": "deleted", "session_id": session_id}
+
+
+@app.get("/history")
+async def get_history(session_id: Optional[str] = None, limit: Optional[int] = Query(default=50, le=200)):
+    """Get conversation history for a session."""
+    messages = memory.get_history(session_id=session_id, limit=limit)
+    return {"session_id": session_id, "messages": messages, "count": len(messages)}
+
+
+@app.get("/history/{session_id}")
+async def get_session_history(session_id: str, limit: Optional[int] = Query(default=50, le=200)):
+    """Get conversation history for a specific session."""
+    session = memory.get_session(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    messages = memory.get_history(session_id=session_id, limit=limit)
+    return {"session_id": session_id, "messages": messages, "count": len(messages)}
 
 
 @app.get("/tools")
