@@ -13,7 +13,7 @@ from src.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-# Super-Brain v3.4 Configuration
+# Super-Brain v3.5 Configuration
 SUPERBRAIN_CONFIG = {
     "max_iterations_simple": 10,
     "max_iterations_complex": 15,
@@ -21,6 +21,7 @@ SUPERBRAIN_CONFIG = {
     "tool_timeout": 60,
     "composio_timeout": 90,
     "temperature": 0,
+    "max_tools_to_bind": 100, # Increased for OpenAI
 }
 
 COMPLEX_TASK_PATTERNS = [
@@ -37,8 +38,6 @@ NESTED_JSON_PATTERNS = [
     r"<function=(\w+)\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})></function>",
     r"<function=(\w+)\s*(\{.*?\})></function>",
     r'\{"name":\s*"(\w+)",\s*"arguments":\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})\}',
-    r'```(?:json)?\s*\{"name":\s*"(\w+)",\s*"arguments":\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})\}\s*```',
-    r'<function\s*=\s*(\w+)\s*>\s*(\{(?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})*\})\s*</function>',
 ]
 
 
@@ -74,15 +73,12 @@ def _is_complex_task(prompt: str) -> bool:
     for pattern in COMPLEX_TASK_PATTERNS:
         if re.search(pattern, prompt_lower):
             return True
-    if len(prompt.split('.')) > 3 or len(prompt) > 300:
-        return True
     return False
 
 
 def _greedy_extract_json(text: str) -> Optional[str]:
     start = text.find('{')
-    if start == -1:
-        return None
+    if start == -1: return None
     depth = 0
     in_string = False
     escape_next = False
@@ -97,10 +93,8 @@ def _greedy_extract_json(text: str) -> Optional[str]:
         if char == '"' and not escape_next:
             in_string = not in_string
             continue
-        if in_string:
-            continue
-        if char == '{':
-            depth += 1
+        if in_string: continue
+        if char == '{': depth += 1
         elif char == '}':
             depth -= 1
             if depth == 0:
@@ -108,23 +102,8 @@ def _greedy_extract_json(text: str) -> Optional[str]:
                 try:
                     json.loads(candidate)
                     return candidate
-                except json.JSONDecodeError:
-                    start = text.find('{', i + 1)
-                    if start == -1:
-                        return None
-                    depth = 0
-                    continue
+                except: continue
     return None
-
-
-def _reinforce_tool_name(func_name: str, known_tools: list[str]) -> str:
-    if func_name in known_tools:
-        return func_name
-    func_lower = func_name.lower()
-    for known in known_tools:
-        if known.lower() == func_lower:
-            return known
-    return func_name
 
 
 class AgentOrchestrator:
@@ -153,7 +132,11 @@ class AgentOrchestrator:
             return []
         try:
             from src.tools.composio_tool import get_composio_langchain_tools
-            tools = get_composio_langchain_tools(apps=["gmail", "googlecalendar", "github", "slack", "notion"])
+            # Load specific high-priority toolsets for Reggie
+            tools = get_composio_langchain_tools(
+                apps=["gmail", "googlecalendar", "github", "slack", "notion"]
+            )
+            logger.info(f"Super-Brain loaded {len(tools)} Composio tools")
             return tools
         except Exception as e:
             logger.warning(f"Failed to load Composio tools: {e}")
@@ -164,9 +147,22 @@ class AgentOrchestrator:
         if native_tools: all_tools.extend(native_tools)
         if self._composio_tools: all_tools.extend(self._composio_tools)
         
-        # Groq/OpenAI limit
-        if len(all_tools) > 40:
-            return all_tools[:40]
+        limit = SUPERBRAIN_CONFIG["max_tools_to_bind"]
+        if settings.llm_provider == "groq":
+            limit = 40 # Groq is more sensitive
+            
+        if len(all_tools) > limit:
+            # Prioritize core tools
+            priority_prefixes = ["GMAIL_", "GOOGLECALENDAR_", "GITHUB_", "WEB_SEARCH"]
+            prioritized = []
+            others = []
+            for t in all_tools:
+                name = (getattr(t, 'name', '') or t.get('name', '')).upper()
+                if any(name.startswith(p) for p in priority_prefixes):
+                    prioritized.append(t)
+                else:
+                    others.append(t)
+            return (prioritized + others)[:limit]
         return all_tools
 
     async def _call_llm(self, messages: list[dict], tools: list[Any], retry_count: int = 0) -> dict:
@@ -184,7 +180,6 @@ class AgentOrchestrator:
                 elif role == "user":
                     lc_messages.append(HumanMessage(content=content))
                 elif role == "assistant":
-                    # FIX: Pass tool_calls back to LangChain so the next ToolMessage has a valid parent
                     tool_calls = []
                     if "tool_calls" in msg:
                         for tc in msg["tool_calls"]:
@@ -192,13 +187,16 @@ class AgentOrchestrator:
                                 args = json.loads(tc["function"]["arguments"])
                             except:
                                 args = {}
+                            # Ensure tool_call ID is passed
+                            tc_id = tc.get("id") or f"call_{len(tool_calls)}"
                             tool_calls.append({
-                                "id": tc.get("id"),
+                                "id": tc_id,
                                 "name": tc["function"]["name"],
                                 "args": args
                             })
                     lc_messages.append(AIMessage(content=content, tool_calls=tool_calls))
                 elif role == "tool":
+                    # Tool ID MUST match a call ID in the preceding AIMessage
                     lc_messages.append(ToolMessage(content=content, tool_call_id=msg.get("tool_call_id", "unknown")))
             
             llm = self._llm
@@ -212,9 +210,9 @@ class AgentOrchestrator:
             if hasattr(response, "tool_calls") and response.tool_calls:
                 result["tool_calls"] = [
                     {
-                        "id": tc.get("id", f"call_{i}"),
+                        "id": tc.get("id") or f"call_{i}",
                         "function": {
-                            "name": _reinforce_tool_name(tc["name"], self._known_tool_names),
+                            "name": tc["name"],
                             "arguments": json.dumps(tc.get("args", {}))
                         }
                     }
@@ -250,7 +248,6 @@ class AgentOrchestrator:
                 raw_args = match.group(2).strip()
                 try:
                     json.loads(raw_args)
-                    func_name = _reinforce_tool_name(func_name, self._known_tool_names)
                     return {"role": "assistant", "content": "", "tool_calls": [{"id": f"recovered_{retry_count}", "function": {"name": func_name, "arguments": raw_args}}]}
                 except: continue
         return None
@@ -260,10 +257,14 @@ class AgentOrchestrator:
         system_msg = SYSTEM_PROMPT.format(memory_context=self.memory.get_system_context())
         messages = [{"role": "system", "content": system_msg}]
         if history:
-            messages.extend(history)
+            # Only use non-empty messages
+            messages.extend([h for h in history if h.get("content") or h.get("tool_calls")])
         else:
             messages.extend(self.memory.get_history()[:-1])
-        messages.append({"role": "user", "content": user_prompt})
+        
+        # Ensure user prompt is present
+        if not messages or messages[-1].get("content") != user_prompt:
+            messages.append({"role": "user", "content": user_prompt})
 
         native_schemas = self.registry.list_tools()
         tool_call_log = []
@@ -307,7 +308,7 @@ class AgentOrchestrator:
                 except Exception as e:
                     result_text = f"Error: {str(e)}"
 
-                tool_call_log.append({"tool": func_name, "args": func_args, "result": result_text[:500], "success": success})
+                tool_call_log.append({"tool": func_name, "args": func_args, "result": result_text[:1000], "success": success})
                 messages.append({"role": "tool", "tool_call_id": call_id, "content": result_text})
 
         return AgentResponse(content=messages[-1].get("content", "Max iterations reached."), tool_calls=tool_call_log, iterations_used=max_iter)
