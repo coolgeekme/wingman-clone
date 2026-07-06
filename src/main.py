@@ -1,7 +1,7 @@
 import logging
-from typing import Optional
+from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,7 +18,7 @@ registry.auto_discover()
 memory = MemoryManager(storage_path=settings.memory_storage_path)
 agent = AgentOrchestrator(tool_registry=registry, memory=memory)
 
-app = FastAPI(title="Wingman Clone", version="0.2.2")
+app = FastAPI(title="Wingman Clone", version="0.3.0")
 
 # --- CORS Configuration ---
 app.add_middleware(
@@ -32,7 +32,6 @@ app.add_middleware(
 
 # --- Request / Response models ---
 class ChatRequest(BaseModel):
-    # Support both 'prompt' (old) and 'message' (new Wingman UI)
     prompt: Optional[str] = None
     message: Optional[str] = None
     history: Optional[list[dict]] = Field(default_factory=list)
@@ -70,7 +69,6 @@ async def chat(req: ChatRequest):
         raise HTTPException(status_code=400, detail="Prompt or message cannot be empty")
     
     try:
-        # We pass the history from the frontend to the agent process
         result = await agent.process(query, history=req.history)
         return ChatResponse(response=result.content, tool_calls=result.tool_calls)
     except Exception as e:
@@ -92,6 +90,51 @@ async def get_facts():
 async def save_fact(req: FactRequest):
     memory.save_fact(req.key, req.value)
     return {"status": "saved", "key": req.key}
+
+
+# --- Integrations Management ---
+
+@app.get("/integrations/connect/{app_name}")
+async def get_connection_url(app_name: str, redirect_url: Optional[str] = None):
+    if not settings.composio_api_key:
+        raise HTTPException(status_code=500, detail="COMPOSIO_API_KEY not configured")
+    
+    try:
+        from composio import ComposioToolSet
+        toolset = ComposioToolSet(api_key=settings.composio_api_key)
+        # Using a fixed entity ID for the user
+        entity = toolset.get_entity(id="default")
+        
+        connection = entity.initiate_connection(
+            app_name=app_name.lower(),
+            redirect_url=redirect_url
+        )
+        
+        return {
+            "app_name": app_name,
+            "redirect_url": connection.redirect_url,
+            "connection_id": connection.connection_id
+        }
+    except Exception as e:
+        logger.error(f"Failed to initiate connection for {app_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/integrations/list")
+async def list_integrations():
+    if not settings.composio_api_key:
+        return {"integrations": []}
+    
+    try:
+        from composio import ComposioToolSet
+        toolset = ComposioToolSet(api_key=settings.composio_api_key)
+        # Return a list of commonly used apps or fetch all from Composio
+        # For simplicity, returning a curated list of apps we support in the UI
+        apps = ["gmail", "googlecalendar", "github", "slack", "notion", "discord", "linkedin"]
+        return {"integrations": apps}
+    except Exception as e:
+        logger.error(f"Failed to list integrations: {e}")
+        return {"integrations": []}
 
 
 if __name__ == "__main__":
