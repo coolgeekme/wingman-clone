@@ -96,25 +96,51 @@ async def save_fact(req: FactRequest):
 
 @app.get("/integrations/connect/{app_name}")
 async def get_connection_url(app_name: str, redirect_url: Optional[str] = None):
+    """Initiate an OAuth connection for a given app (e.g. gmail, github).
+    
+    Uses composio SDK v0.17+ with Composio client to:
+    1. Look up the auth config for the toolkit
+    2. Create a connected account with the redirect URI
+    3. Return the OAuth redirect URL to the caller
+    """
     if not settings.composio_api_key:
         raise HTTPException(status_code=500, detail="COMPOSIO_API_KEY not configured")
     
     try:
-        from composio import ComposioToolSet
-        toolset = ComposioToolSet(api_key=settings.composio_api_key)
-        # Using a fixed entity ID for the user
-        entity = toolset.get_entity(id="default")
-        
-        connection = entity.initiate_connection(
-            app_name=app_name.lower(),
-            redirect_url=redirect_url
+        from composio import Composio
+
+        sdk = Composio(api_key=settings.composio_api_key)
+
+        # Find the auth config for this toolkit
+        auth_configs = sdk.client.auth_configs.list(toolkit_slug=app_name.lower())
+        if not auth_configs.items:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No auth configuration found for app '{app_name}'"
+            )
+
+        # Use the first available auth config
+        auth_config_id = auth_configs.items[0].id
+
+        # Build the connection params
+        connection_params = {}
+        if redirect_url:
+            connection_params["redirect_uri"] = redirect_url
+
+        # Initiate the connection
+        result = sdk.client.connected_accounts.create(
+            auth_config={"id": auth_config_id},
+            connection=connection_params
         )
-        
+
         return {
             "app_name": app_name,
-            "redirect_url": connection.redirect_url,
-            "connection_id": connection.connection_id
+            "redirect_url": result.redirect_url,
+            "connection_id": result.id,
+            "status": result.status
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to initiate connection for {app_name}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -122,14 +148,15 @@ async def get_connection_url(app_name: str, redirect_url: Optional[str] = None):
 
 @app.get("/integrations/list")
 async def list_integrations():
+    """List available integration toolkits."""
     if not settings.composio_api_key:
         return {"integrations": []}
     
     try:
-        from composio import ComposioToolSet
-        toolset = ComposioToolSet(api_key=settings.composio_api_key)
-        # Return a list of commonly used apps or fetch all from Composio
-        # For simplicity, returning a curated list of apps we support in the UI
+        from composio import Composio
+
+        sdk = Composio(api_key=settings.composio_api_key)
+        # Return a curated list of apps we support in the UI
         apps = ["gmail", "googlecalendar", "github", "slack", "notion", "discord", "linkedin"]
         return {"integrations": apps}
     except Exception as e:
